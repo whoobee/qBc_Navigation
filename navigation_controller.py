@@ -9,7 +9,10 @@ feature centered while the wheel base turns more slowly.
 
 State machine:
     IDLE → ACQUIRING → SERVOING → NEXT → (loop or IDLE)
-    RECOVERY on tracking loss, IDLE on safety trigger.
+    SERVOING → DEADRECKON on exit-gate detection (floor/ceiling target exit).
+    RECOVERY on genuine tracking loss, with odometry backtrack.
+    ToF collision guard can short-circuit to NEXT from SERVOING/DEADRECKON.
+    IDLE on safety trigger.
 """
 
 import json
@@ -41,6 +44,9 @@ TOPIC_SAFETY_STATUS = "robot/safety/status"
 TOPIC_WHEELS_CMD = "robot/wheels/cmd"
 TOPIC_JOINTS_CMD = "robot/joints/cmd"
 TOPIC_ODOMETRY = "robot/odometry/pose"
+TOPIC_IMU = "robot/imu/orientation"
+TOPIC_TOF = "robot/sensors/tof"
+TOPIC_SETTINGS_NAV = "robot/settings/navigation"
 TOPIC_STREAM_REQ = "robot/navigation/stream/request"
 TOPIC_STREAM_VIEWER = "robot/navigation/stream/viewer"
 VIEWER_TIMEOUT = 3.0  # Seconds without heartbeat before stopping captures
@@ -56,6 +62,7 @@ STATE_ACQUIRING = "acquiring"
 STATE_SERVOING = "servoing"
 STATE_NEXT = "next"
 STATE_RECOVERY = "recovery"
+STATE_DEADRECKON = "deadreckon"
 
 # IBVS parameters
 LAMBDA_GAIN = 0.5           # IBVS control gain (lower = slower/safer)
@@ -69,11 +76,15 @@ Z_MAX = 4.0                 # Maximum estimated depth (meters)
 REACHED_THRESHOLD = 0.08    # Normalized distance from image center
 REACHED_FRAMES = 3          # Consecutive frames to confirm reached
 
-# Neck stabilization
-NECK_GAIN = 120.0           # Horizontal error → neck degrees (nx=0.5 → 60 deg)
+# Neck stabilization (PD controller — tuned for ~200ms frame latency)
+NECK_KP = 10.0              # Proportional gain (degrees per unit error per cycle)
+NECK_KD = 12.0              # Derivative gain (strong damping for high-latency loop)
 NECK_RECENTER_GAIN = 1.0    # Wheel yaw driven by neck angle (deg → angular rate)
+NECK_RECENTER_RATE = 0.92   # Decay factor for recentering inside deadzone
 NECK_SPEED = 120.0          # Neck servo speed in deg/s (fast response)
 NECK_MAX = 80.0             # Limit neck range (don't use full ±90)
+NECK_DEADZONE = 0.03        # Normalized horizontal error below which neck holds still
+NECK_INVERT = False         # Invert neck direction (True if camera is mirrored)
 
 # Frame capture
 FRAME_TIMEOUT = 0.5         # Seconds to wait for frame
@@ -81,6 +92,19 @@ SERVO_LOOP_HZ = 10          # Target servoing frequency
 
 # Recovery
 MAX_RECOVERY_ATTEMPTS = 3
+RECOVERY_DRIVE_RPM = 15.0       # Conservative speed for backtracking
+RECOVERY_MAX_BACKTRACK_MM = 500  # Cap backtrack distance
+
+# Exit-gate detection (floor/ceiling target exits camera FOV)
+EXIT_BOTTOM_THRESHOLD = 0.85    # track_y above this → bottom exit (floor target)
+EXIT_TOP_THRESHOLD = 0.15       # track_y below this → top exit (ceiling target)
+PITCH_LEVEL_TOLERANCE = 10.0    # Degrees — pitch within this of 0° is "level"
+DEADRECKON_DEPTH_FACTOR = 0.3   # Fraction of last depth estimate as remaining distance
+DEADRECKON_SPEED_RPM = 15.0     # Conservative forward speed during dead-reckoning
+DEADRECKON_TIMEOUT = 5.0        # Safety timeout for dead-reckoning (seconds)
+
+# ToF collision guard
+TOF_COLLISION_MM = 150          # Mark reached if front distance below this
 
 
 class NavigationController:
@@ -92,6 +116,9 @@ class NavigationController:
         (TOPIC_FRAME_READY, 1),
         (TOPIC_SAFETY_STATUS, 1),
         (TOPIC_ODOMETRY, 0),
+        (TOPIC_IMU, 0),
+        (TOPIC_TOF, 0),
+        (TOPIC_SETTINGS_NAV, 1),
         (TOPIC_STREAM_REQ, 0),
         (TOPIC_STREAM_VIEWER, 0),
     ]
@@ -114,6 +141,30 @@ class NavigationController:
         # Safety
         self._safety_ok = True
 
+        # Sensor state (from Teensy telemetry, updated via MQTT callbacks)
+        self._odom_x_mm = 0.0
+        self._odom_y_mm = 0.0
+        self._odom_heading_deg = 0.0
+        self._imu_pitch_deg = 0.0
+        self._tof_front_mm = float('inf')
+
+        # Acquisition pose (recorded when entering SERVOING for backtrack recovery)
+        self._acq_pose = None  # (x_mm, y_mm, heading_deg)
+
+        # Last valid tracking state (for exit-gate classification on loss)
+        self._last_track_y = 0.5
+        self._last_z_est = 1.0
+
+        # PD controller state for neck
+        self._prev_ex = 0.0
+
+        # Frame rate measurement
+        self._last_frame_time = 0.0
+        self._actual_fps = 0.0
+
+        # Dead-reckoning state (for driving remaining distance after exit-gate)
+        self._deadreckon_target_mm = 0.0
+
         # Frame synchronization
         self._waiting_for_frame = False
         self._frame_path = None
@@ -132,6 +183,10 @@ class NavigationController:
         client.message_callback_add(TOPIC_NAV_CMD, self._on_command)
         client.message_callback_add(TOPIC_FRAME_READY, self._on_frame_ready)
         client.message_callback_add(TOPIC_SAFETY_STATUS, self._on_safety)
+        client.message_callback_add(TOPIC_ODOMETRY, self._on_odometry)
+        client.message_callback_add(TOPIC_IMU, self._on_imu)
+        client.message_callback_add(TOPIC_TOF, self._on_tof)
+        client.message_callback_add(TOPIC_SETTINGS_NAV, self._on_settings)
         client.message_callback_add(TOPIC_STREAM_REQ, self._on_stream_request)
         client.message_callback_add(TOPIC_STREAM_VIEWER, self._on_viewer_heartbeat)
 
@@ -152,6 +207,7 @@ class NavigationController:
                 "tracking_features": self._tracker.get_feature_count(),
                 "tracking_mode": self._tracker.get_mode(),
                 "neck_deg": self._neck_deg,
+                "fps": round(self._actual_fps, 1),
             }),
             qos=1, retain=True,
         )
@@ -224,7 +280,9 @@ class NavigationController:
             logger.warning("Received empty waypoints")
             return
 
-        logger.info("Received %d waypoints, frame: %s", len(waypoints), frame_path)
+        floor_boundary = data.get("floor_boundary")
+        logger.info("Received %d waypoints, frame: %s, floor: %s",
+                     len(waypoints), frame_path, floor_boundary)
 
         with self._lock:
             self._waypoints = waypoints
@@ -232,6 +290,10 @@ class NavigationController:
             self._current_wp_index = 0
             self._reached_counter = 0
             self._recovery_attempts = 0
+
+        # Pass floor boundary to debug visualizer
+        if floor_boundary is not None:
+            self._debug_viz._floor_boundary = float(floor_boundary)
 
         # Generate initial debug image
         debug_path = self._debug_viz.set_waypoints(frame_path, waypoints)
@@ -313,6 +375,50 @@ class NavigationController:
             self._safety_ok = True
 
     # ------------------------------------------------------------------
+    # Sensor callbacks (odometry, IMU, ToF)
+    # ------------------------------------------------------------------
+
+    def _on_odometry(self, client, userdata, msg):
+        try:
+            data = json.loads(msg.payload)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        self._odom_x_mm = data.get("x_mm", self._odom_x_mm)
+        self._odom_y_mm = data.get("y_mm", self._odom_y_mm)
+        self._odom_heading_deg = data.get("heading_deg", self._odom_heading_deg)
+
+    def _on_imu(self, client, userdata, msg):
+        try:
+            data = json.loads(msg.payload)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        self._imu_pitch_deg = data.get("pitch", self._imu_pitch_deg)
+
+    def _on_tof(self, client, userdata, msg):
+        try:
+            data = json.loads(msg.payload)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        left = data.get("left_mm", float('inf'))
+        right = data.get("right_mm", float('inf'))
+        # Use minimum of forward-facing sensors as front distance proxy
+        self._tof_front_mm = min(left, right)
+
+    def _on_settings(self, client, userdata, msg):
+        try:
+            data = json.loads(msg.payload)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        global NECK_DEADZONE, NECK_INVERT
+        if "neck_deadzone" in data:
+            NECK_DEADZONE = max(0.0, min(0.72, float(data["neck_deadzone"])))
+            self._debug_viz._neck_deadzone = NECK_DEADZONE
+            logger.info("Neck deadzone updated: %.3f", NECK_DEADZONE)
+        if "neck_invert" in data:
+            NECK_INVERT = bool(data["neck_invert"])
+            logger.info("Neck invert updated: %s", NECK_INVERT)
+
+    # ------------------------------------------------------------------
     # Navigation loop (runs in a thread)
     # ------------------------------------------------------------------
 
@@ -336,6 +442,8 @@ class NavigationController:
                 self._do_next()
             elif state == STATE_RECOVERY:
                 self._do_recovery()
+            elif state == STATE_DEADRECKON:
+                self._do_deadreckon()
             elif state == STATE_IDLE:
                 break
 
@@ -373,6 +481,7 @@ class NavigationController:
 
         if self._tracker.initialize_target(frame, wp["x"], wp["y"]):
             self._reached_counter = 0
+            self._acq_pose = (self._odom_x_mm, self._odom_y_mm, self._odom_heading_deg)
             self._set_state(STATE_SERVOING)
             mode = self._tracker.get_mode() or "unknown"
             self._publish_debug_log(
@@ -382,20 +491,26 @@ class NavigationController:
             )
         else:
             logger.warning("Feature acquisition failed — not enough features")
-            self._recovery_attempts += 1
-            if self._recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
-                self._set_state(STATE_IDLE)
-                self._publish_debug_log("acquisition_failed",
-                                        "Feature acquisition failed after max retries")
-            else:
-                # Try capturing a new frame
-                self._frame_path_for_init = None
-                self._set_state(STATE_RECOVERY)
+            # Don't increment _recovery_attempts here — _do_recovery handles the counting.
+            # Just transition to RECOVERY which will retry or abort.
+            self._frame_path_for_init = None
+            self._set_state(STATE_RECOVERY)
 
     def _do_servoing(self):
         """One cycle of the visual servoing loop."""
         period = 1.0 / SERVO_LOOP_HZ
         start = time.monotonic()
+
+        # ── ToF collision guard ──
+        if self._tof_front_mm < TOF_COLLISION_MM:
+            self._stop_wheels()
+            self._publish_debug_log(
+                "tof_reached",
+                f"ToF collision guard: {self._tof_front_mm:.0f}mm < {TOF_COLLISION_MM}mm "
+                f"— marking WP{self._current_wp_index + 1} reached",
+            )
+            self._set_state(STATE_NEXT)
+            return
 
         # Capture a new frame
         frame = self._capture_frame()
@@ -407,15 +522,48 @@ class NavigationController:
                 self._stop_event.wait(period - elapsed)
             return
 
+        # Measure actual frame rate
+        now = time.monotonic()
+        if self._last_frame_time > 0:
+            dt = now - self._last_frame_time
+            if dt > 0:
+                self._actual_fps = 1.0 / dt
+        self._last_frame_time = now
+
         # Update tracker
         track_x, track_y, valid = self._tracker.update(frame)
 
+        if valid:
+            # Store tracking state every cycle for exit-gate analysis on loss
+            self._last_track_y = track_y
+            self._last_z_est = Z_MIN + (1.0 - track_y) * (Z_MAX - Z_MIN)
+
         if not valid:
-            logger.warning("Tracking lost — entering recovery")
             self._stop_wheels()
-            self._set_state(STATE_RECOVERY)
-            self._publish_debug_log("tracking_lost",
-                                    f"Tracking lost at WP{self._current_wp_index + 1}")
+
+            # ── Exit-gate detection ──
+            exit_type = self._classify_exit(self._last_track_y)
+
+            if exit_type:
+                # Target exited the frame naturally — dead-reckon remaining distance
+                remaining_mm = self._last_z_est * DEADRECKON_DEPTH_FACTOR * 1000.0
+                self._deadreckon_target_mm = remaining_mm
+                self._publish_debug_log(
+                    f"exit_gate_{exit_type}",
+                    f"Target exited {exit_type} (y={self._last_track_y:.2f}, "
+                    f"pitch={self._imu_pitch_deg:.1f}deg) — "
+                    f"dead-reckoning {remaining_mm:.0f}mm forward",
+                )
+                self._set_state(STATE_DEADRECKON)
+            else:
+                # Genuine tracking loss — recovery
+                logger.warning("Tracking lost — entering recovery")
+                self._set_state(STATE_RECOVERY)
+                self._publish_debug_log(
+                    "tracking_lost",
+                    f"Tracking lost at WP{self._current_wp_index + 1} "
+                    f"(last_y={self._last_track_y:.2f})",
+                )
             return
 
         # Update debug visualization — only write to disk if someone is watching
@@ -432,7 +580,7 @@ class NavigationController:
         target_nx, target_ny = 0.0, 0.0
 
         # Depth heuristic from vertical image position
-        z_est = Z_MIN + (1.0 - track_y) * (Z_MAX - Z_MIN)
+        z_est = self._last_z_est
 
         # Compute IBVS control
         left_rpm, right_rpm, neck_cmd = self._compute_control(
@@ -496,11 +644,11 @@ class NavigationController:
             self._set_state(STATE_ACQUIRING)
 
     def _do_recovery(self):
-        """Attempt to re-acquire tracking after loss."""
+        """Attempt to re-acquire tracking after loss, with odometry backtracking."""
         self._stop_wheels()
         self._recovery_attempts += 1
 
-        if self._recovery_attempts > MAX_RECOVERY_ATTEMPTS:
+        if self._recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
             logger.error("Max recovery attempts reached — aborting navigation")
             self._center_neck()
             self._set_state(STATE_IDLE)
@@ -513,6 +661,21 @@ class NavigationController:
             f"Recovery attempt {self._recovery_attempts}/{MAX_RECOVERY_ATTEMPTS}",
         )
 
+        # Backtrack toward acquisition pose if available
+        if self._acq_pose is not None:
+            acq_x, acq_y, _ = self._acq_pose
+            dx = acq_x - self._odom_x_mm
+            dy = acq_y - self._odom_y_mm
+            dist_mm = math.sqrt(dx * dx + dy * dy)
+
+            if dist_mm > 20.0:
+                backtrack_mm = min(dist_mm, RECOVERY_MAX_BACKTRACK_MM)
+                self._publish_debug_log(
+                    "recovery_backtrack",
+                    f"Reversing {backtrack_mm:.0f}mm toward acquisition pose",
+                )
+                self._drive_distance(-RECOVERY_DRIVE_RPM, backtrack_mm)
+
         # Wait a moment for the robot to settle
         self._stop_event.wait(0.5)
         if self._stop_event.is_set():
@@ -521,6 +684,129 @@ class NavigationController:
         # Capture fresh frame and try to re-acquire
         self._frame_path_for_init = None
         self._set_state(STATE_ACQUIRING)
+
+    # ------------------------------------------------------------------
+    # Exit-gate detection and dead-reckoning
+    # ------------------------------------------------------------------
+
+    def _classify_exit(self, last_y):
+        """Classify whether tracking loss is an exit-gate or genuine loss.
+
+        Uses the last known vertical image position and IMU pitch to determine
+        if the target naturally exited the camera FOV (floor/ceiling) vs a
+        genuine tracking failure (mid-frame loss or side exit).
+
+        Returns:
+            'bottom', 'top', or None (genuine loss).
+        """
+        pitch = self._imu_pitch_deg
+
+        # Bottom exit: floor target dropped below camera FOV
+        if last_y > EXIT_BOTTOM_THRESHOLD:
+            # Accept if pitch is level or nose-down (positive or near-zero)
+            if pitch > -PITCH_LEVEL_TOLERANCE:
+                return "bottom"
+
+        # Top exit: ceiling target rose above camera FOV
+        if last_y < EXIT_TOP_THRESHOLD:
+            # Accept if pitch is level or nose-up (negative or near-zero)
+            if pitch < PITCH_LEVEL_TOLERANCE:
+                return "top"
+
+        return None
+
+    def _do_deadreckon(self):
+        """Drive forward a computed distance after exit-gate, then mark reached.
+
+        Uses odometry to measure actual distance traveled rather than
+        pure time-based estimation.
+        """
+        target_mm = self._deadreckon_target_mm
+        if target_mm <= 0:
+            self._set_state(STATE_NEXT)
+            return
+
+        start_x = self._odom_x_mm
+        start_y = self._odom_y_mm
+        start_time = time.monotonic()
+
+        self._publish_debug_log("deadreckon_start",
+                                f"Driving forward {target_mm:.0f}mm")
+
+        self._publish_wheel_cmd(DEADRECKON_SPEED_RPM, DEADRECKON_SPEED_RPM)
+
+        while not self._stop_event.is_set():
+            if not self._safety_ok:
+                self._stop_wheels()
+                self._set_state(STATE_IDLE)
+                return
+
+            # ToF collision guard during dead-reckoning
+            if self._tof_front_mm < TOF_COLLISION_MM:
+                self._stop_wheels()
+                self._publish_debug_log(
+                    "tof_reached",
+                    f"ToF collision during dead-reckon: {self._tof_front_mm:.0f}mm",
+                )
+                self._set_state(STATE_NEXT)
+                return
+
+            # Check distance traveled via odometry
+            dx = self._odom_x_mm - start_x
+            dy = self._odom_y_mm - start_y
+            traveled = math.sqrt(dx * dx + dy * dy)
+
+            if traveled >= target_mm:
+                self._stop_wheels()
+                self._publish_debug_log(
+                    "deadreckon_reached",
+                    f"Traveled {traveled:.0f}mm — WP{self._current_wp_index + 1} reached",
+                )
+                self._set_state(STATE_NEXT)
+                return
+
+            # Timeout safety
+            if (time.monotonic() - start_time) > DEADRECKON_TIMEOUT:
+                self._stop_wheels()
+                self._publish_debug_log(
+                    "deadreckon_timeout",
+                    f"Timeout after {DEADRECKON_TIMEOUT:.0f}s — marking reached",
+                )
+                self._set_state(STATE_NEXT)
+                return
+
+            self._stop_event.wait(0.1)
+
+        self._stop_wheels()
+
+    def _drive_distance(self, rpm, distance_mm):
+        """Drive at a given RPM until odometry shows the specified distance traveled.
+
+        Args:
+            rpm: Wheel speed (negative = reverse).
+            distance_mm: Target distance in mm.
+        """
+        start_x = self._odom_x_mm
+        start_y = self._odom_y_mm
+        start_time = time.monotonic()
+
+        self._publish_wheel_cmd(rpm, rpm)
+
+        while not self._stop_event.is_set():
+            dx = self._odom_x_mm - start_x
+            dy = self._odom_y_mm - start_y
+            traveled = math.sqrt(dx * dx + dy * dy)
+
+            if traveled >= distance_mm:
+                break
+            if (time.monotonic() - start_time) > DEADRECKON_TIMEOUT:
+                break
+            if not self._safety_ok:
+                break
+
+            self._stop_event.wait(0.05)
+
+        self._stop_wheels()
 
     # ------------------------------------------------------------------
     # IBVS + Neck control
@@ -549,14 +835,26 @@ class NavigationController:
             (left_rpm, right_rpm, neck_deg)
         """
         ex = nx - target_nx  # Horizontal error (positive = feature is right of center)
+        if NECK_INVERT:
+            ex = -ex           # Flip for mirrored camera mounting
         ey = ny - target_ny  # Vertical error (positive = feature is below center)
 
-        # --- Neck: fast proportional tracking of horizontal error ---
-        # Directly maps image error to neck angle.
-        # Feature left of center (ex < 0) → neck turns left (negative degrees).
-        # Feature right of center (ex > 0) → neck turns right (positive degrees).
-        # Servo convention: negative = left, positive = right (from idle BT).
-        neck_cmd = ex * NECK_GAIN
+        # --- Neck: PD controller with dead-zone ---
+        # Proportional term drives toward center, derivative term dampens
+        # oscillation caused by latency between command and camera frame.
+        # Inside the dead-zone, gently recenter toward 0°.
+        if abs(ex) < NECK_DEADZONE:
+            # Decay toward center — keeps target in the middle of the band
+            neck_cmd = self._neck_deg * NECK_RECENTER_RATE
+            if abs(neck_cmd) < 0.5:
+                neck_cmd = 0.0
+            self._prev_ex = ex
+        else:
+            # PD: correction = Kp * error + Kd * d(error)/dt
+            d_ex = ex - self._prev_ex
+            correction = NECK_KP * ex + NECK_KD * d_ex
+            neck_cmd = self._neck_deg + correction
+            self._prev_ex = ex
         neck_cmd = max(-NECK_MAX, min(NECK_MAX, neck_cmd))
         self._neck_deg = neck_cmd
 

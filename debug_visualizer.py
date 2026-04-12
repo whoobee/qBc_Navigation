@@ -26,6 +26,8 @@ COLOR_REACHED = (200, 200, 200)      # Gray — reached waypoint
 COLOR_PATH_LINE = (255, 180, 0)      # Cyan-ish — path line
 COLOR_TRACKING = (0, 0, 255)         # Red — current tracked position
 COLOR_TEXT = (255, 255, 255)         # White — labels
+COLOR_DEADZONE = (0, 180, 255)      # Orange — neck deadzone band
+COLOR_HORIZON = (0, 255, 255)       # Yellow — detected floor boundary
 
 WAYPOINT_RADIUS = 16
 CURRENT_RADIUS = 24
@@ -48,6 +50,8 @@ class DebugVisualizer:
         self._reached_indices = set()
         self._tracked_pos = None
         self._last_image_path = None
+        self._neck_deadzone = 0.03  # normalized camera coords
+        self._floor_boundary = None  # normalized y (0-1), set externally
 
     def set_waypoints(self, frame_path, waypoints):
         """Load the base frame and store waypoint list.
@@ -208,6 +212,71 @@ class DebugVisualizer:
         cv2.line(img, (cx, cy - cross_size), (cx, cy + cross_size),
                  COLOR_CURRENT, 1, cv2.LINE_AA)
         cv2.circle(img, (cx, cy), 4, COLOR_CURRENT, -1, cv2.LINE_AA)
+
+        # Draw waypoint path and markers (static overlay — no tracking cost)
+        if self._waypoints:
+            wp_px = [(int(wp["x"] * w), int(wp["y"] * h)) for wp in self._waypoints]
+
+            # Path lines
+            for i in range(len(wp_px) - 1):
+                cv2.line(img, wp_px[i], wp_px[i + 1],
+                         COLOR_PATH_LINE, 2, cv2.LINE_AA)
+
+            # Waypoint markers
+            for i, (px, py) in enumerate(wp_px):
+                if i in self._reached_indices:
+                    # Reached — gray filled with checkmark
+                    cv2.circle(img, (px, py), WAYPOINT_RADIUS, COLOR_REACHED, -1, cv2.LINE_AA)
+                    cv2.line(img, (px - 6, py), (px - 1, py + 5), COLOR_TEXT, 2, cv2.LINE_AA)
+                    cv2.line(img, (px - 1, py + 5), (px + 8, py - 6), COLOR_TEXT, 2, cv2.LINE_AA)
+                elif i == self._current_wp_index:
+                    # Current target — green ring with crosshairs
+                    cv2.circle(img, (px, py), CURRENT_RADIUS, COLOR_CURRENT, 2, cv2.LINE_AA)
+                    cv2.circle(img, (px, py), 4, COLOR_CURRENT, -1, cv2.LINE_AA)
+                else:
+                    # Pending — orange filled
+                    cv2.circle(img, (px, py), WAYPOINT_RADIUS, COLOR_WAYPOINT, -1, cv2.LINE_AA)
+
+                cv2.putText(img, f"WP{i + 1}", (px + WAYPOINT_RADIUS + 4, py + 5),
+                            LABEL_FONT, LABEL_SCALE, COLOR_TEXT, 1, cv2.LINE_AA)
+
+        # Draw detected floor boundary (horizon line)
+        if self._floor_boundary is not None and 0.0 < self._floor_boundary < 1.0:
+            hy = int(self._floor_boundary * h)
+            # Dashed horizontal line
+            dash_len = 20
+            gap_len = 12
+            x = 0
+            while x < w:
+                x_end = min(x + dash_len, w)
+                cv2.line(img, (x, hy), (x_end, hy), COLOR_HORIZON, 1, cv2.LINE_AA)
+                x += dash_len + gap_len
+            # Label
+            cv2.putText(img, "FLOOR", (8, hy - 6),
+                        LABEL_FONT, 0.4, COLOR_HORIZON, 1, cv2.LINE_AA)
+
+        # Draw neck deadzone band — full-height vertical band (neck only pans horizontally)
+        if self._neck_deadzone > 0:
+            # Deadzone is in normalized camera coords: nx = (u - CX) / FX
+            # Convert back to pixel offset: dz_px = deadzone * FX
+            from camera_model import FX
+            dz_px = int(self._neck_deadzone * FX)
+
+            # Full-height vertical edge lines
+            cv2.line(img, (cx - dz_px, 0), (cx - dz_px, h),
+                     COLOR_DEADZONE, 1, cv2.LINE_AA)
+            cv2.line(img, (cx + dz_px, 0), (cx + dz_px, h),
+                     COLOR_DEADZONE, 1, cv2.LINE_AA)
+
+            # Subtle filled band overlay spanning full frame height
+            overlay = img.copy()
+            cv2.rectangle(overlay, (cx - dz_px, 0), (cx + dz_px, h),
+                          COLOR_DEADZONE, -1)
+            cv2.addWeighted(overlay, 0.06, img, 0.94, 0, img)
+
+            # Label at top
+            cv2.putText(img, "DEADZONE", (cx - dz_px + 4, 20),
+                        LABEL_FONT, 0.4, COLOR_DEADZONE, 1, cv2.LINE_AA)
 
         # Draw tracked waypoint position (where the features actually are)
         if self._tracked_pos is not None:
