@@ -17,7 +17,10 @@ logger = logging.getLogger("qBc_Nav.debug_viz")
 
 DEBUG_DIR = Path(__file__).parent / "debug"
 TEMP_DIR = Path(__file__).parent / "temp"
-LATEST_FRAME = str(TEMP_DIR / "latest_frame.jpg")
+# Use shared memory for the live frame — eliminates disk I/O for the browser stream
+SHM_DIR = Path("/dev/shm")
+LATEST_FRAME = str(SHM_DIR / "qb_debug_frame.jpg")
+LATEST_FRAME_TMP = str(SHM_DIR / "qb_debug_frame.tmp.jpg")
 
 # Colors (BGR)
 COLOR_WAYPOINT = (0, 200, 255)       # Orange — pending waypoint
@@ -121,27 +124,40 @@ class DebugVisualizer:
         if tracked_x is not None and tracked_y is not None:
             self._tracked_pos = (tracked_x, tracked_y)
         img = self._annotate_live(frame)
-        cv2.imwrite(LATEST_FRAME, img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        try:
+            if cv2.imwrite(LATEST_FRAME_TMP, img, [cv2.IMWRITE_JPEG_QUALITY, 85]):
+                os.replace(LATEST_FRAME_TMP, LATEST_FRAME)
+        except OSError:
+            pass
 
     @staticmethod
     def cleanup_temp():
-        """Remove all files from the temp directory."""
+        """Remove temp and SHM debug frames."""
         if TEMP_DIR.exists():
             for f in TEMP_DIR.iterdir():
                 try:
                     f.unlink()
                 except OSError:
                     pass
+        for p in (LATEST_FRAME, LATEST_FRAME_TMP):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     @staticmethod
     def write_passthrough_frame(frame):
-        """Write a raw camera frame to latest_frame.jpg (no annotation).
+        """Write a raw camera frame to the debug output (no annotation).
 
         Used when navigation is idle to provide a live camera feed.
         """
         if frame is None:
             return
-        cv2.imwrite(LATEST_FRAME, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        try:
+            if cv2.imwrite(LATEST_FRAME_TMP, frame, [cv2.IMWRITE_JPEG_QUALITY, 85]):
+                os.replace(LATEST_FRAME_TMP, LATEST_FRAME)
+        except OSError:
+            pass
 
     def get_last_image_path(self):
         """Return the path of the last generated debug image."""

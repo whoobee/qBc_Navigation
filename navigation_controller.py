@@ -87,8 +87,9 @@ NECK_DEADZONE = 0.03        # Normalized horizontal error below which neck holds
 NECK_INVERT = False         # Invert neck direction (True if camera is mirrored)
 
 # Frame capture
-FRAME_TIMEOUT = 0.5         # Seconds to wait for frame
-SERVO_LOOP_HZ = 10          # Target servoing frequency
+FRAME_TIMEOUT = 0.5         # Seconds to wait for on-demand frame (acquisition only)
+SHM_NAV_FRAME = "/dev/shm/qb_nav_frame.jpg"  # Shared-memory frame from vision stream
+SERVO_LOOP_HZ = 15          # Target servoing frequency (achievable with SHM stream)
 
 # Recovery
 MAX_RECOVERY_ATTEMPTS = 3
@@ -424,6 +425,11 @@ class NavigationController:
 
     def _navigation_loop(self):
         """Main navigation state machine loop."""
+        # Start continuous capture stream for low-latency servoing
+        self._start_nav_stream()
+        # Brief delay for the stream to start producing frames
+        time.sleep(0.3)
+
         self._set_state(STATE_ACQUIRING)
 
         while not self._stop_event.is_set():
@@ -450,6 +456,7 @@ class NavigationController:
         # Clean up on exit
         self._stop_wheels()
         self._center_neck()
+        self._stop_nav_stream()
         logger.info("Navigation loop ended in state: %s", self._state)
 
     def _do_acquiring(self):
@@ -468,11 +475,13 @@ class NavigationController:
             f"Acquiring WP{self._current_wp_index + 1} at ({wp['x']:.2f}, {wp['y']:.2f})",
         )
 
-        # Use the initial frame or capture a fresh one
+        # Use the initial frame, SHM stream, or MQTT capture (in priority order)
         if frame_path and os.path.isfile(frame_path):
             frame = cv2.imread(frame_path)
         else:
-            frame = self._capture_frame()
+            frame = self._read_shm_frame()
+            if frame is None:
+                frame = self._capture_frame()
 
         if frame is None:
             logger.error("Failed to get frame for acquisition")
@@ -512,11 +521,13 @@ class NavigationController:
             self._set_state(STATE_NEXT)
             return
 
-        # Capture a new frame
-        frame = self._capture_frame()
+        # Read latest frame from shared memory (no MQTT round-trip)
+        frame = self._read_shm_frame()
+        if frame is None:
+            # Fall back to MQTT-based capture if SHM not available
+            frame = self._capture_frame()
         if frame is None:
             logger.debug("Frame capture failed during servoing")
-            # Don't immediately fail — try again next cycle
             elapsed = time.monotonic() - start
             if elapsed < period:
                 self._stop_event.wait(period - elapsed)
@@ -885,8 +896,22 @@ class NavigationController:
     # Frame capture
     # ------------------------------------------------------------------
 
+    def _read_shm_frame(self):
+        """Read the latest frame from shared memory (fast, no MQTT round-trip).
+
+        Returns:
+            BGR numpy array or None if not available.
+        """
+        try:
+            if not os.path.isfile(SHM_NAV_FRAME):
+                return None
+            frame = cv2.imread(SHM_NAV_FRAME)
+            return frame
+        except Exception:
+            return None
+
     def _capture_frame(self):
-        """Request a frame from vision service and load it.
+        """Request a single frame from vision service via MQTT (for acquisition).
 
         Returns:
             BGR numpy array or None on failure.
@@ -913,6 +938,22 @@ class NavigationController:
 
         frame = cv2.imread(path)
         return frame
+
+    def _start_nav_stream(self):
+        """Tell the vision service to start continuous capture to shared memory."""
+        self._client.publish(
+            TOPIC_VISION_CMD,
+            json.dumps({"command": "start_nav_stream"}),
+            qos=1,
+        )
+
+    def _stop_nav_stream(self):
+        """Tell the vision service to stop continuous capture."""
+        self._client.publish(
+            TOPIC_VISION_CMD,
+            json.dumps({"command": "stop_nav_stream"}),
+            qos=1,
+        )
 
     # ------------------------------------------------------------------
     # Motor / servo commands
