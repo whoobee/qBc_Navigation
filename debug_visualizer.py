@@ -130,6 +130,38 @@ class DebugVisualizer:
         except OSError:
             pass
 
+    def update_live_frame_reactive(self, frame, current_index, *,
+                                    floor_mask=None, corridors=None,
+                                    goal_bearing_deg=0.0,
+                                    selected_corridor=None):
+        """Annotate a live frame with reactive navigation overlays.
+
+        Shows the floor segmentation mask, corridor openness bars,
+        goal heading arrow, and the selected corridor highlight.
+
+        Args:
+            frame: BGR numpy array.
+            current_index: Current target waypoint index.
+            floor_mask: boolean (H, W) floor segmentation mask, or None.
+            corridors: list of dicts from FloorSegmenter.compute_corridors().
+            goal_bearing_deg: desired heading relative to robot (+ = right).
+            selected_corridor: index of the chosen corridor, or None.
+        """
+        if frame is None:
+            return
+        self._current_wp_index = current_index
+        for i in range(current_index):
+            self._reached_indices.add(i)
+        img = self._annotate_reactive(
+            frame, floor_mask, corridors,
+            goal_bearing_deg, selected_corridor,
+        )
+        try:
+            if cv2.imwrite(LATEST_FRAME_TMP, img, [cv2.IMWRITE_JPEG_QUALITY, 85]):
+                os.replace(LATEST_FRAME_TMP, LATEST_FRAME)
+        except OSError:
+            pass
+
     @staticmethod
     def cleanup_temp():
         """Remove temp and SHM debug frames."""
@@ -324,6 +356,116 @@ class DebugVisualizer:
         reached = len(self._reached_indices)
         status = f"WP {self._current_wp_index + 1}/{total}  |  reached: {reached}"
         cv2.putText(img, status, (20, 40), LABEL_FONT, 1.0, COLOR_TEXT, 2, cv2.LINE_AA)
+
+        return img
+
+    def _annotate_reactive(self, frame, floor_mask, corridors,
+                            goal_bearing_deg, selected_corridor):
+        """Draw reactive navigation overlays: floor mask, corridors, heading."""
+        img = frame.copy()
+        h, w = img.shape[:2]
+        cx, cy = w // 2, h // 2
+
+        # ── Semi-transparent floor mask overlay (green tint) ──
+        if floor_mask is not None:
+            overlay = img.copy()
+            overlay[floor_mask] = (
+                overlay[floor_mask] * 0.6
+                + np.array([0, 180, 0], dtype=np.float64) * 0.4
+            ).astype(np.uint8)
+            img = overlay
+
+        # ── Corridor score bars at bottom of frame ──
+        if corridors:
+            bar_height = 40
+            bar_y_top = h - bar_height - 10
+            n = len(corridors)
+            cw_px = w // n
+
+            for i, c in enumerate(corridors):
+                x1 = i * cw_px
+                x2 = x1 + cw_px if i < n - 1 else w
+
+                # Fill proportional to openness
+                fill_h = int(c["openness"] * bar_height)
+                fill_top = bar_y_top + bar_height - fill_h
+
+                # Colour: green if selected, yellow if open, red if blocked
+                if selected_corridor is not None and i == selected_corridor:
+                    color = (0, 255, 0)
+                elif c["openness"] > 0.12:
+                    color = (0, 200, 255)
+                else:
+                    color = (0, 0, 200)
+
+                cv2.rectangle(img, (x1 + 2, fill_top), (x2 - 2, bar_y_top + bar_height),
+                              color, -1)
+                # Border
+                cv2.rectangle(img, (x1 + 2, bar_y_top), (x2 - 2, bar_y_top + bar_height),
+                              (180, 180, 180), 1)
+                # Openness label
+                pct = int(c["openness"] * 100)
+                cv2.putText(img, f"{pct}%",
+                            (x1 + 6, bar_y_top - 4),
+                            LABEL_FONT, 0.4, COLOR_TEXT, 1, cv2.LINE_AA)
+
+        # ── Goal heading arrow from center ──
+        import math
+        arrow_len = 120
+        angle_rad = math.radians(-goal_bearing_deg)  # screen coords
+        ax = int(cx + arrow_len * math.sin(-angle_rad))
+        ay = int(cy - arrow_len * math.cos(angle_rad))
+        cv2.arrowedLine(img, (cx, cy), (ax, ay),
+                        (0, 255, 255), 3, cv2.LINE_AA, tipLength=0.25)
+        cv2.putText(img, f"goal {goal_bearing_deg:+.0f}deg",
+                    (cx + 10, cy - 10),
+                    LABEL_FONT, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # ── Image-center crosshair ──
+        cross = 20
+        cv2.line(img, (cx - cross, cy), (cx + cross, cy),
+                 COLOR_CURRENT, 1, cv2.LINE_AA)
+        cv2.line(img, (cx, cy - cross), (cx, cy + cross),
+                 COLOR_CURRENT, 1, cv2.LINE_AA)
+
+        # ── Waypoint path overlay (from base frame) ──
+        if self._waypoints:
+            wp_px = [(int(wp["x"] * w), int(wp["y"] * h)) for wp in self._waypoints]
+            for i in range(len(wp_px) - 1):
+                cv2.line(img, wp_px[i], wp_px[i + 1],
+                         COLOR_PATH_LINE, 2, cv2.LINE_AA)
+            for i, (px, py) in enumerate(wp_px):
+                if i in self._reached_indices:
+                    cv2.circle(img, (px, py), WAYPOINT_RADIUS,
+                               COLOR_REACHED, -1, cv2.LINE_AA)
+                elif i == self._current_wp_index:
+                    cv2.circle(img, (px, py), CURRENT_RADIUS,
+                               COLOR_CURRENT, 2, cv2.LINE_AA)
+                else:
+                    cv2.circle(img, (px, py), WAYPOINT_RADIUS,
+                               COLOR_WAYPOINT, -1, cv2.LINE_AA)
+                cv2.putText(img, f"WP{i + 1}",
+                            (px + WAYPOINT_RADIUS + 4, py + 5),
+                            LABEL_FONT, LABEL_SCALE, COLOR_TEXT, 1, cv2.LINE_AA)
+
+        # ── Floor boundary line ──
+        if self._floor_boundary is not None and 0.0 < self._floor_boundary < 1.0:
+            hy = int(self._floor_boundary * h)
+            dash, gap = 20, 12
+            x = 0
+            while x < w:
+                cv2.line(img, (x, hy), (min(x + dash, w), hy),
+                         COLOR_HORIZON, 1, cv2.LINE_AA)
+                x += dash + gap
+            cv2.putText(img, "FLOOR", (8, hy - 6),
+                        LABEL_FONT, 0.4, COLOR_HORIZON, 1, cv2.LINE_AA)
+
+        # ── Status overlay ──
+        total = len(self._waypoints)
+        reached = len(self._reached_indices)
+        status = f"WP {self._current_wp_index + 1}/{total}  |  reached: {reached}"
+        cv2.putText(img, status, (20, 40),
+                    LABEL_FONT, 1.0, COLOR_TEXT, 2, cv2.LINE_AA)
 
         return img
 
