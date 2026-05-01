@@ -89,8 +89,11 @@ NECK_SPEED = 120.0
 SHM_NAV_FRAME = "/dev/shm/qb_nav_frame.jpg"
 SERVO_LOOP_HZ = 15
 
-# ToF collision guard
-TOF_COLLISION_MM = 150
+# ToF collision guard defaults (overridable via robot/settings/navigation)
+TOF_COLLISION_MM_DEFAULT = 150
+# Final-waypoint ToF stop distance — keep more clearance from the destination
+# object so the bot doesn't look like it's about to ram it.
+TOF_FINAL_TARGET_MM_DEFAULT = 300
 
 
 class NavigationController:
@@ -135,6 +138,15 @@ class NavigationController:
         self._odom_heading_deg = 0.0
         self._imu_pitch_deg = 0.0
         self._tof_front_mm = float('inf')
+
+        # Bench test mode — robot suspended, ignore odometry-based arrival
+        # and ToF collision guard so phantom wheel-encoder travel doesn't
+        # falsely complete waypoints.
+        self._bench_test_mode = False
+
+        # ToF stop thresholds (configurable via robot/settings/navigation)
+        self._tof_intermediate_mm = TOF_COLLISION_MM_DEFAULT
+        self._tof_final_target_mm = TOF_FINAL_TARGET_MM_DEFAULT
 
         # Starting pose (recorded when navigation begins)
         self._start_heading_deg = 0.0
@@ -340,32 +352,68 @@ class NavigationController:
             data = json.loads(msg.payload)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
-        self._odom_x_mm = data.get("x_mm", self._odom_x_mm)
-        self._odom_y_mm = data.get("y_mm", self._odom_y_mm)
-        self._odom_heading_deg = data.get("heading_deg", self._odom_heading_deg)
+        # Null / NaN means the firmware has no confident reading right now —
+        # keep the previous value rather than corrupting state.
+        x = data.get("x_mm")
+        y = data.get("y_mm")
+        h = data.get("heading_deg")
+        if x is not None:
+            self._odom_x_mm = x
+        if y is not None:
+            self._odom_y_mm = y
+        if h is not None:
+            self._odom_heading_deg = h
 
     def _on_imu(self, client, userdata, msg):
         try:
             data = json.loads(msg.payload)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
-        self._imu_pitch_deg = data.get("pitch", self._imu_pitch_deg)
+        pitch = data.get("pitch")
+        if pitch is not None:
+            self._imu_pitch_deg = pitch
 
     def _on_tof(self, client, userdata, msg):
         try:
             data = json.loads(msg.payload)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
-        left = data.get("left_mm", float('inf'))
-        right = data.get("right_mm", float('inf'))
-        self._tof_front_mm = min(left, right)
+        # Use the dedicated front TOF (replaced the YDLIDAR). The bridge sends
+        # null when the firmware has no confident reading — treat as +inf so
+        # the collision guard doesn't fire on missing data.
+        front = data.get("front_mm")
+        if front is None or front <= 0:
+            self._tof_front_mm = float('inf')
+        else:
+            self._tof_front_mm = float(front)
 
     def _on_settings(self, client, userdata, msg):
         try:
             data = json.loads(msg.payload)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
-        # Future: tunable parameters via MQTT
+        if "bench_test_mode" in data:
+            new_val = bool(data["bench_test_mode"])
+            if new_val != self._bench_test_mode:
+                logger.info("Bench test mode: %s → %s",
+                            self._bench_test_mode, new_val)
+                self._publish_debug_log(
+                    "bench_test_mode",
+                    f"Bench test mode {'ENABLED' if new_val else 'disabled'}",
+                )
+            self._bench_test_mode = new_val
+
+        if "tof_intermediate_mm" in data:
+            try:
+                self._tof_intermediate_mm = int(data["tof_intermediate_mm"])
+            except (TypeError, ValueError):
+                pass
+
+        if "tof_final_target_mm" in data:
+            try:
+                self._tof_final_target_mm = int(data["tof_final_target_mm"])
+            except (TypeError, ValueError):
+                pass
 
     # ------------------------------------------------------------------
     # Waypoint → odometry goal conversion
@@ -476,11 +524,18 @@ class NavigationController:
         start = time.monotonic()
 
         # ── ToF collision guard ──
-        if self._tof_front_mm < TOF_COLLISION_MM:
+        # Skipped in bench test mode — robot is suspended so ToF readings
+        # may be misleading and we don't want phantom completions.
+        is_final_wp = self._current_wp_index >= len(self._waypoints) - 1
+        tof_threshold = (self._tof_final_target_mm if is_final_wp
+                         else self._tof_intermediate_mm)
+        if (not self._bench_test_mode
+                and self._tof_front_mm < tof_threshold):
             self._stop_wheels()
             self._publish_debug_log(
                 "tof_reached",
                 f"ToF collision guard: {self._tof_front_mm:.0f}mm "
+                f"(threshold {tof_threshold}mm) "
                 f"— marking WP{self._current_wp_index + 1} reached",
             )
             self._set_state(STATE_NEXT)
@@ -538,19 +593,23 @@ class NavigationController:
             )
 
         # ── Check waypoint reached (odometry distance) ──
-        dx = self._odom_x_mm - self._wp_start_x
-        dy = self._odom_y_mm - self._wp_start_y
-        traveled_mm = math.sqrt(dx * dx + dy * dy)
+        # Skipped in bench test mode — wheel encoders integrate phantom
+        # travel while the robot is suspended, which would falsely complete
+        # waypoints almost instantly.
+        if not self._bench_test_mode:
+            dx = self._odom_x_mm - self._wp_start_x
+            dy = self._odom_y_mm - self._wp_start_y
+            traveled_mm = math.sqrt(dx * dx + dy * dy)
 
-        if traveled_mm >= self._wp_target_dist_mm - REACHED_MARGIN_MM:
-            self._publish_debug_log(
-                "waypoint_reached",
-                f"WP{self._current_wp_index + 1} reached "
-                f"(traveled={traveled_mm:.0f}mm, "
-                f"target={self._wp_target_dist_mm:.0f}mm)",
-            )
-            self._set_state(STATE_NEXT)
-            return
+            if traveled_mm >= self._wp_target_dist_mm - REACHED_MARGIN_MM:
+                self._publish_debug_log(
+                    "waypoint_reached",
+                    f"WP{self._current_wp_index + 1} reached "
+                    f"(traveled={traveled_mm:.0f}mm, "
+                    f"target={self._wp_target_dist_mm:.0f}mm)",
+                )
+                self._set_state(STATE_NEXT)
+                return
 
         # Pace the loop
         elapsed = time.monotonic() - start
